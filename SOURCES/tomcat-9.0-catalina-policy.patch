@@ -1,0 +1,33 @@
+--- conf/catalina.policy.orig	2021-12-09 13:29:38.000000000 -0500
++++ conf/catalina.policy	2022-06-24 14:57:25.418254977 -0400
+@@ -56,6 +56,30 @@ grant codeBase "file:${java.home}/lib/ex
+ //        permission java.security.AllPermission;
+ //};
+ 
++// ========== RHEL SPECIFIC CODE PERMISSIONS =======================================
++
++// Allowing everything in /usr/share/java allows too many unknowns to be permitted
++// Specifying the individual jars that tomcat needs to function with the security manager
++// is the safest way forward.
++grant codeBase "file:/usr/share/java/tomcat-servlet-4.0-api.jar" {
++        permission java.security.AllPermission;
++};
++grant codeBase "file:/usr/share/java/tomcat-jsp-2.3-api.jar" {
++        permission java.security.AllPermission;
++};
++grant codeBase "file:/usr/share/java/tomcat-el-3.0-api.jar" {
++        permission java.security.AllPermission;
++};
++grant codeBase "file:/usr/share/java/ant.jar" {
++        permission java.security.AllPermission;
++};
++grant codeBase "file:/usr/share/java/ant-launcher.jar" {
++        permission java.security.AllPermission;
++};
++grant codeBase "file:/usr/lib/jvm/java/lib/tools.jar" {
++        permission java.security.AllPermission;
++};
++
+ 
+ // ========== CATALINA CODE PERMISSIONS =======================================
+ 
