@@ -1,0 +1,404 @@
+diff -rupN java/org/apache/catalina/WebResourceLockSet.java java/org/apache/catalina/WebResourceLockSet.java
+--- java/org/apache/catalina/WebResourceLockSet.java	1970-01-01 02:00:00.000000000 +0200
++++ java/org/apache/catalina/WebResourceLockSet.java	2025-01-10 17:22:29.107395000 +0200
+@@ -0,0 +1,73 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.catalina;
++
++import java.util.concurrent.atomic.AtomicInteger;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++
++/**
++ * Interface implemented by {@link WebResourceSet} implementations that wish to provide locking functionality.
++ */
++public interface WebResourceLockSet {
++
++    /**
++     * Lock the resource at the provided path for reading. The resource is not required to exist. Read locks are not
++     * exclusive.
++     *
++     * @param path The path to the resource to be locked for reading
++     *
++     * @return The {@link ResourceLock} that must be passed to {@link #unlockForRead(ResourceLock)} to release the lock
++     */
++    ResourceLock lockForRead(String path);
++
++    /**
++     * Release a read lock from the resource associated with the given {@link ResourceLock}.
++     *
++     * @param resourceLock The {@link ResourceLock} associated with the resource for which a read lock should be
++     *                         released
++     */
++    void unlockForRead(ResourceLock resourceLock);
++
++    /**
++     * Lock the resource at the provided path for writing. The resource is not required to exist. Write locks are
++     * exclusive.
++     *
++     * @param path The path to the resource to be locked for writing
++     *
++     * @return The {@link ResourceLock} that must be passed to {@link #unlockForWrite(ResourceLock)} to release the lock
++     */
++    ResourceLock lockForWrite(String path);
++
++    /**
++     * Release the write lock from the resource associated with the given {@link ResourceLock}.
++     *
++     * @param resourceLock The {@link ResourceLock} associated with the resource for which the write lock should be
++     *                         released
++     */
++    void unlockForWrite(ResourceLock resourceLock);
++
++
++    class ResourceLock {
++        public final AtomicInteger count = new AtomicInteger(0);
++        public final ReentrantReadWriteLock reentrantLock = new ReentrantReadWriteLock();
++        public final String key;
++
++        public ResourceLock(String key) {
++            this.key = key;
++        }
++    }
++}
+diff -rupN java/org/apache/catalina/webresources/DirResourceSet.java java/org/apache/catalina/webresources/DirResourceSet.java
+--- java/org/apache/catalina/webresources/DirResourceSet.java	2021-12-09 13:29:38.000000000 +0200
++++ java/org/apache/catalina/webresources/DirResourceSet.java	2025-01-17 14:42:08.836344422 +0200
+@@ -22,24 +22,35 @@ import java.io.IOException;
+ import java.io.InputStream;
+ import java.nio.file.Files;
+ import java.nio.file.StandardCopyOption;
++import java.util.HashMap;
++import java.util.Locale;
++import java.util.Map;
+ import java.util.Set;
+ import java.util.jar.Manifest;
+ 
+ import org.apache.catalina.LifecycleException;
+ import org.apache.catalina.WebResource;
++import org.apache.catalina.WebResourceLockSet;
+ import org.apache.catalina.WebResourceRoot;
+ import org.apache.catalina.WebResourceRoot.ResourceSetType;
+ import org.apache.catalina.util.ResourceSet;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
++import org.apache.tomcat.util.http.RequestUtil;
+ 
+ /**
+  * Represents a {@link org.apache.catalina.WebResourceSet} based on a directory.
+  */
+-public class DirResourceSet extends AbstractFileResourceSet {
++public class DirResourceSet extends AbstractFileResourceSet implements WebResourceLockSet {
+ 
+     private static final Log log = LogFactory.getLog(DirResourceSet.class);
+ 
++    private boolean caseSensitive = true;
++
++    private Map<String,ResourceLock> resourceLocksByPath = new HashMap<>();
++    private Object resourceLocksByPathLock = new Object();
++
++
+     /**
+      * A no argument constructor is required for this to work with the digester.
+      */
+@@ -98,22 +109,33 @@ public class DirResourceSet extends Abst
+         String webAppMount = getWebAppMount();
+         WebResourceRoot root = getRoot();
+         if (path.startsWith(webAppMount)) {
+-            File f = file(path.substring(webAppMount.length()), false);
+-            if (f == null) {
+-                return new EmptyResource(root, path);
+-            }
+-            if (!f.exists()) {
+-                return new EmptyResource(root, path, f);
+-            }
+-            if (f.isDirectory() && path.charAt(path.length() - 1) != '/') {
+-                path = path + '/';
++            /*
++             * Lock the path for reading until the WebResource has been constructed. The lock prevents concurrent reads
++             * and writes (e.g. HTTP GET and PUT / DELETE) for the same path causing corruption of the FileResource
++             * where some of the fields are set as if the file exists and some as set as if it does not.
++             */
++            ResourceLock lock = lockForRead(path);
++            try {
++                File f = file(path.substring(webAppMount.length()), false);
++                if (f == null) {
++                    return new EmptyResource(root, path);
++                }
++                if (!f.exists()) {
++                    return new EmptyResource(root, path, f);
++                }
++                if (f.isDirectory() && path.charAt(path.length() - 1) != '/') {
++                    path = path + '/';
++                }
++                return new FileResource(root, path, f, isReadOnly(), getManifest(), this, lock.key);
++            } finally {
++                unlockForRead(lock);
+             }
+-            return new FileResource(root, path, f, isReadOnly(), getManifest());
+         } else {
+             return new EmptyResource(root, path);
+         }
+     }
+ 
++
+     @Override
+     public String[] list(String path) {
+         checkPath(path);
+@@ -251,32 +273,43 @@ public class DirResourceSet extends Abst
+             return false;
+         }
+ 
+-        File dest = null;
+         String webAppMount = getWebAppMount();
+-        if (path.startsWith(webAppMount)) {
++        if (!path.startsWith(webAppMount)) {
++            return false;
++        }
++
++        File dest = null;
++        /*
++         * Lock the path for writing until the write is complete. The lock prevents concurrent reads and writes (e.g.
++         * HTTP GET and PUT / DELETE) for the same path causing corruption of the FileResource where some of the fields
++         * are set as if the file exists and some as set as if it does not.
++         */
++        ResourceLock lock = lockForWrite(path);
++        try {
+             dest = file(path.substring(webAppMount.length()), false);
+             if (dest == null) {
+                 return false;
+             }
+-        } else {
+-            return false;
+-        }
+ 
+-        if (dest.exists() && !overwrite) {
+-            return false;
+-        }
+ 
+-        try {
+-            if (overwrite) {
+-                Files.copy(is, dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
+-            } else {
+-                Files.copy(is, dest.toPath());
++            if (dest.exists() && !overwrite) {
++                return false;
++            }
++
++            try {
++                if (overwrite) {
++                    Files.copy(is, dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
++                } else {
++                    Files.copy(is, dest.toPath());
++                }
++            } catch (IOException ioe) {
++                return false;
+             }
+-        } catch (IOException ioe) {
+-            return false;
+-        }
+ 
+-        return true;
++            return true;
++        } finally {
++            unlockForWrite(lock);
++        }
+     }
+ 
+     @Override
+@@ -291,6 +324,7 @@ public class DirResourceSet extends Abst
+     @Override
+     protected void initInternal() throws LifecycleException {
+         super.initInternal();
++        caseSensitive = isCaseSensitive();
+         // Is this an exploded web application?
+         if (getWebAppMount().equals("")) {
+             // Look for a manifest
+@@ -304,4 +338,105 @@ public class DirResourceSet extends Abst
+             }
+         }
+     }
++
++
++    /*
++     * Determines if this ResourceSet is based on a case sensitive file system or not.
++     */
++    private boolean isCaseSensitive() {
++        try {
++            String canonicalPath = getFileBase().getCanonicalPath();
++            File upper = new File(canonicalPath.toUpperCase(Locale.ENGLISH));
++            if (!canonicalPath.equals(upper.getCanonicalPath())) {
++                return true;
++            }
++            File lower = new File(canonicalPath.toLowerCase(Locale.ENGLISH));
++            if (!canonicalPath.equals(lower.getCanonicalPath())) {
++                return true;
++            }
++            /*
++             * Both upper and lower case versions of the current fileBase have the same canonical path so the file
++             * system must be case insensitive.
++             */
++        } catch (IOException ioe) {
++            log.warn(sm.getString("dirResourceSet.isCaseSensitive.fail", getFileBase().getAbsolutePath()), ioe);
++        }
++        return false;
++    }
++    private String getLockKey(String path) {
++        // Normalize path to ensure that the same key is used for the same path.
++        String normalisedPath = RequestUtil.normalize(path);
++        if (caseSensitive) {
++            return normalisedPath;
++        }
++        return normalisedPath.toLowerCase(Locale.ENGLISH);
++    }
++    @Override
++    public ResourceLock lockForRead(String path) {
++        String key = getLockKey(path);
++        ResourceLock resourceLock = null;
++        synchronized (resourceLocksByPathLock) {
++            /*
++             * Obtain the ResourceLock and increment the usage count inside the sync to ensure that that map always has
++             * a consistent view of the currently "in-use" ResourceLocks.
++             */
++            resourceLock = resourceLocksByPath.get(key);
++            if (resourceLock == null) {
++                resourceLock = new ResourceLock(key);
++                resourceLocksByPath.put(key, resourceLock);
++            }
++            resourceLock.count.incrementAndGet();
++        }
++        // Obtain the lock outside the sync as it will block if there is a current write lock.
++        resourceLock.reentrantLock.readLock().lock();
++        return resourceLock;
++    }
++    @Override
++    public void unlockForRead(ResourceLock resourceLock) {
++        // Unlock outside the sync as there is no need to do it inside.
++        resourceLock.reentrantLock.readLock().unlock();
++        synchronized (resourceLocksByPathLock) {
++            /*
++             * Decrement the usage count and remove ResourceLocks no longer required inside the sync to ensure that that
++             * map always has a consistent view of the currently "in-use" ResourceLocks.
++             */
++            if (resourceLock.count.decrementAndGet() == 0) {
++                resourceLocksByPath.remove(resourceLock.key);
++            }
++        }
++    }
++    @Override
++    public ResourceLock lockForWrite(String path) {
++        String key = getLockKey(path);
++        ResourceLock resourceLock = null;
++        synchronized (resourceLocksByPathLock) {
++            /*
++             * Obtain the ResourceLock and increment the usage count inside the sync to ensure that that map always has
++             * a consistent view of the currently "in-use" ResourceLocks.
++             */
++            resourceLock = resourceLocksByPath.get(key);
++            if (resourceLock == null) {
++                resourceLock = new ResourceLock(key);
++                resourceLocksByPath.put(key, resourceLock);
++            }
++            resourceLock.count.incrementAndGet();
++        }
++        // Obtain the lock outside the sync as it will block if there are any other current locks.
++        resourceLock.reentrantLock.writeLock().lock();
++        return resourceLock;
++    }
++    @Override
++    public void unlockForWrite(ResourceLock resourceLock) {
++        // Unlock outside the sync as there is no need to do it inside.
++        resourceLock.reentrantLock.writeLock().unlock();
++        synchronized (resourceLocksByPathLock) {
++            /*
++             * Decrement the usage count and remove ResourceLocks no longer required inside the sync to ensure that that
++             * map always has a consistent view of the currently "in-use" ResourceLocks.
++             */
++            if (resourceLock.count.decrementAndGet() == 0) {
++                resourceLocksByPath.remove(resourceLock.key);
++            }
++        }
++    }
+ }
+diff -rupN java/org/apache/catalina/webresources/FileResource.java java/org/apache/catalina/webresources/FileResource.java
+--- java/org/apache/catalina/webresources/FileResource.java	2021-12-09 13:29:38.000000000 +0200
++++ java/org/apache/catalina/webresources/FileResource.java	2025-01-17 14:41:16.585281119 +0200
+@@ -30,6 +30,8 @@ import java.nio.file.attribute.BasicFile
+ import java.security.cert.Certificate;
+ import java.util.jar.Manifest;
+ 
++import org.apache.catalina.WebResourceLockSet;
++import org.apache.catalina.WebResourceLockSet.ResourceLock;
+ import org.apache.catalina.WebResourceRoot;
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -62,11 +64,20 @@ public class FileResource extends Abstra
+     private final boolean readOnly;
+     private final Manifest manifest;
+     private final boolean needConvert;
++    private final WebResourceLockSet lockSet;
++    private final String lockKey;
+ 
+     public FileResource(WebResourceRoot root, String webAppPath,
+             File resource, boolean readOnly, Manifest manifest) {
++        this(root, webAppPath, resource, readOnly, manifest, null, null);
++    }
++
++    public FileResource(WebResourceRoot root, String webAppPath, File resource, boolean readOnly, Manifest manifest,
++                        WebResourceLockSet lockSet, String lockKey) {
+         super(root,webAppPath);
+         this.resource = resource;
++        this.lockSet = lockSet;
++        this.lockKey = lockKey;
+ 
+         if (webAppPath.charAt(webAppPath.length() - 1) == '/') {
+             String realName = resource.getName() + '/';
+@@ -120,7 +131,22 @@ public class FileResource extends Abstra
+         if (readOnly) {
+             return false;
+         }
+-        return resource.delete();
++        /*
++         * Lock the path for writing until the delete is complete. The lock prevents concurrent reads and writes (e.g.
++         * HTTP GET and PUT / DELETE) for the same path causing corruption of the FileResource where some of the fields
++         * are set as if the file exists and some as set as if it does not.
++         */
++        ResourceLock lock = null;
++        if (lockSet != null) {
++            lock = lockSet.lockForWrite(lockKey);
++        }
++        try {
++            return resource.delete();
++        } finally {
++            if (lockSet != null) {
++                lockSet.unlockForWrite(lock);
++            }
++        }
+     }
+ 
+     @Override
+diff -rupN java/org/apache/catalina/webresources/LocalStrings.properties java/org/apache/catalina/webresources/LocalStrings.properties
+--- java/org/apache/catalina/webresources/LocalStrings.properties	2021-12-09 13:29:38.000000000 +0200
++++ java/org/apache/catalina/webresources/LocalStrings.properties	2025-01-17 14:41:39.210308532 +0200
+@@ -31,6 +31,7 @@ cachedResource.invalidURL=Unable to crea
+ 
+ classpathUrlStreamHandler.notFound=Unable to load the resource [{0}] using the thread context class loader or the current class''s class loader
+ 
++dirResourceSet.isCaseSensitive.fail=Error trying to determine if file system at [{0}] is case sensitive so assuming it is not case sensitive
+ dirResourceSet.manifestFail=Failed to read manifest from [{0}]
+ dirResourceSet.notDirectory=The directory specified by base and internal path [{0}]{1}[{2}] does not exist.
+ dirResourceSet.writeNpe=The input stream may not be null

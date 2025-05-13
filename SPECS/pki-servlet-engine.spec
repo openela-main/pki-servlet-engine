@@ -58,7 +58,7 @@
 Name:          pki-servlet-engine
 Epoch:         1
 Version:       %{major_version}.%{minor_version}.%{micro_version}
-Release:       1%{?dist}
+Release:       1%{?dist}.2
 Summary:       Apache Servlet/JSP Engine, RI for Servlet %{servletspec}/JSP %{jspspec} API
 Group:         System Environment/Daemons
 License:       ASL 2.0
@@ -81,6 +81,8 @@ Patch0:        tomcat-%{major_version}.%{minor_version}-bootstrap-MANIFEST.MF.pa
 Patch1:        tomcat-%{major_version}.%{minor_version}-tomcat-users-webapp.patch
 Patch2:        tomcat-%{major_version}.%{minor_version}-catalina-policy.patch
 Patch3:        exclude-OSGi-metadata.patch
+Patch4:        rhbz-2314686.patch
+Patch5:        rhbz-2332817.patch
 
 BuildArch:     noarch
 
@@ -143,6 +145,8 @@ find . -type f \( -name "*.bat" -o -name "*.class" -o -name Thumbs.db -o -name "
 %patch1 -p0
 %patch2 -p0
 %patch3 -p0
+%patch4 -p0
+%patch5 -p0
 
 # Since we don't support ECJ in RHEL anymore, remove the class that requires it
 %{__rm} -f java/org/apache/jasper/compiler/JDTCompiler.java
@@ -385,6 +389,14 @@ fi
 %{_javadir}/tomcat-servlet-%{servletspec}*.jar
 
 %changelog
+* Fri Jan 17 2025 Dimitris Soumis <dsoumis@redhat.com> - 1:9.0.50-1.el9_2.2
+- Resolves: RHEL-71715
+  pki-servlet-engine: RCE due to TOCTOU issue in JSP compilation (CVE-2024-50379)
+
+* Thu Oct 17 2024 Adam Krajcik <akrajcik@redhat.com> - 1:9.0.50-1.el9_2.1
+- Resolves: RHEL-60105
+  pki-servlet-engine: Denial of service in tomcat (CVE-2024-38286)
+
 * Thu Feb 24 2022 Chris Kelley <ckelley@redhat.com> - 1:9.0.50-1
 - Update to JWS 5.6.1
 

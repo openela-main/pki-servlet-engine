@@ -1,0 +1,151 @@
+--- java/org/apache/tomcat/util/net/LocalStrings.properties.orig	2024-10-16 12:53:11.408992714 +0200
++++ java/org/apache/tomcat/util/net/LocalStrings.properties	2024-10-16 12:54:21.273625279 +0200
+@@ -26,6 +26,8 @@
+ channel.nio.ssl.expandNetOutBuffer=Expanding network output buffer to [{0}] bytes
+ channel.nio.ssl.foundHttp=Found an plain text HTTP request on what should be an encrypted TLS connection
+ channel.nio.ssl.handshakeError=Handshake error
++channel.nio.ssl.handshakeWrapPending=There is already handshake data waiting to be wrapped
++channel.nio.ssl.handshakeWrapQueueTooLong=The queue of handshake data to be wrapped has grown too long
+ channel.nio.ssl.incompleteHandshake=Handshake incomplete, you must complete handshake before reading data.
+ channel.nio.ssl.invalidCloseState=Invalid close state, will not send network data.
+ channel.nio.ssl.invalidStatus=Unexpected status [{0}].
+--- java/org/apache/tomcat/util/net/SecureNio2Channel.java.orig	2024-10-16 12:53:22.726095181 +0200
++++ java/org/apache/tomcat/util/net/SecureNio2Channel.java	2024-10-16 12:54:21.273625279 +0200
+@@ -54,10 +54,12 @@
+     private static final Log log = LogFactory.getLog(SecureNio2Channel.class);
+     private static final StringManager sm = StringManager.getManager(SecureNio2Channel.class);
+ 
+-    // Value determined by observation of what the SSL Engine requested in
+-    // various scenarios
++    // Value determined by observation of what the SSL Engine requested in various scenarios
+     private static final int DEFAULT_NET_BUFFER_SIZE = 16921;
+ 
++    // Much longer than it should ever need to be but short enough to trigger connection closure if something goes wrong
++    private static final int HANDSHAKE_WRAP_QUEUE_LENGTH_LIMIT = 100;
++
+     protected final Nio2Endpoint endpoint;
+ 
+     protected ByteBuffer netInBuffer;
+@@ -68,6 +70,7 @@
+     protected volatile boolean sniComplete = false;
+ 
+     private volatile boolean handshakeComplete = false;
++    private volatile int handshakeWrapQueueLength = 0;
+     private volatile HandshakeStatus handshakeStatus; //gets set by handshake
+ 
+     protected boolean closed;
+@@ -765,6 +768,11 @@
+                     //perform any tasks if needed
+                     if (unwrap.getHandshakeStatus() == HandshakeStatus.NEED_TASK) {
+                         tasks();
++                    } else if (unwrap.getHandshakeStatus() == HandshakeStatus.NEED_WRAP) {
++                        if (++handshakeWrapQueueLength > HANDSHAKE_WRAP_QUEUE_LENGTH_LIMIT) {
++                            throw new ExecutionException(
++                                    new IOException(sm.getString("channel.nio.ssl.handshakeWrapQueueTooLong")));
++                        }
+                     }
+                     //if we need more network data, then bail out for now.
+                     if (unwrap.getStatus() == Status.BUFFER_UNDERFLOW) {
+@@ -895,6 +903,8 @@
+                 if (!netOutBuffer.hasRemaining()) {
+                     netOutBuffer.clear();
+                     SSLEngineResult result = sslEngine.wrap(src, netOutBuffer);
++                    // Call to wrap() will have included any required handshake data
++                    handshakeWrapQueueLength = 0;
+                     written = result.bytesConsumed();
+                     netOutBuffer.flip();
+                     if (result.getStatus() == Status.OK) {
+@@ -960,6 +970,11 @@
+                                 //perform any tasks if needed
+                                 if (unwrap.getHandshakeStatus() == HandshakeStatus.NEED_TASK) {
+                                     tasks();
++                                } else if (unwrap.getHandshakeStatus() == HandshakeStatus.NEED_WRAP) {
++                                    if (++handshakeWrapQueueLength > HANDSHAKE_WRAP_QUEUE_LENGTH_LIMIT) {
++                                        throw new ExecutionException(new IOException(
++                                                sm.getString("channel.nio.ssl.handshakeWrapQueueTooLong")));
++                                    }
+                                 }
+                                 //if we need more network data, then bail out for now.
+                                 if (unwrap.getStatus() == Status.BUFFER_UNDERFLOW) {
+@@ -1073,6 +1088,11 @@
+                                 //perform any tasks if needed
+                                 if (unwrap.getHandshakeStatus() == HandshakeStatus.NEED_TASK) {
+                                     tasks();
++                                } else if (unwrap.getHandshakeStatus() == HandshakeStatus.NEED_WRAP) {
++                                    if (++handshakeWrapQueueLength > HANDSHAKE_WRAP_QUEUE_LENGTH_LIMIT) {
++                                        throw new ExecutionException(new IOException(
++                                                sm.getString("channel.nio.ssl.handshakeWrapQueueTooLong")));
++                                    }
+                                 }
+                                 //if we need more network data, then bail out for now.
+                                 if (unwrap.getStatus() == Status.BUFFER_UNDERFLOW) {
+@@ -1182,6 +1202,8 @@
+             netOutBuffer.clear();
+             // Wrap the source data into the internal buffer
+             SSLEngineResult result = sslEngine.wrap(src, netOutBuffer);
++            // Call to wrap() will have included any required handshake data
++            handshakeWrapQueueLength = 0;
+             final int written = result.bytesConsumed();
+             netOutBuffer.flip();
+             if (result.getStatus() == Status.OK) {
+--- java/org/apache/tomcat/util/net/SecureNioChannel.java.orig	2024-10-16 12:53:34.697203568 +0200
++++ java/org/apache/tomcat/util/net/SecureNioChannel.java	2024-10-16 12:54:21.274625288 +0200
+@@ -66,6 +66,7 @@
+     protected boolean sniComplete = false;
+ 
+     protected boolean handshakeComplete = false;
++    protected boolean needHandshakeWrap = false;
+     protected HandshakeStatus handshakeStatus; //gets set by handshake
+ 
+     protected boolean closed = false;
+@@ -623,6 +624,14 @@
+                 //perform any tasks if needed
+                 if (unwrap.getHandshakeStatus() == HandshakeStatus.NEED_TASK) {
+                     tasks();
++                } else if (unwrap.getHandshakeStatus() == HandshakeStatus.NEED_WRAP) {
++                    if (getOutboundRemaining() == 0) {
++                        handshakeWrap(true);
++                    } else if (needHandshakeWrap) {
++                        throw new IOException(sm.getString("channel.nio.ssl.handshakeWrapPending"));
++                    } else {
++                        needHandshakeWrap = true;
++                    }
+                 }
+                 //if we need more network data, then bail out for now.
+                 if (unwrap.getStatus() == Status.BUFFER_UNDERFLOW) {
+@@ -712,6 +721,14 @@
+                 //perform any tasks if needed
+                 if (unwrap.getHandshakeStatus() == HandshakeStatus.NEED_TASK) {
+                     tasks();
++                } else if (unwrap.getHandshakeStatus() == HandshakeStatus.NEED_WRAP) {
++                    if (getOutboundRemaining() == 0) {
++                        handshakeWrap(true);
++                    } else if (needHandshakeWrap) {
++                        throw new IOException(sm.getString("channel.nio.ssl.handshakeWrapPending"));
++                    } else {
++                        needHandshakeWrap = true;
++                    }
+                 }
+                 //if we need more network data, then bail out for now.
+                 if (unwrap.getStatus() == Status.BUFFER_UNDERFLOW) {
+@@ -812,6 +829,8 @@
+             netOutBuffer.clear();
+ 
+             SSLEngineResult result = sslEngine.wrap(src, netOutBuffer);
++            // Call to wrap() will have included any required handshake data
++            needHandshakeWrap = false;
+             // The number of bytes written
+             int written = result.bytesConsumed();
+             netOutBuffer.flip();
+--- webapps/docs/changelog.xml.orig	2024-10-16 12:53:48.354327221 +0200
++++ webapps/docs/changelog.xml	2024-10-16 12:58:15.205743336 +0200
+@@ -117,6 +117,9 @@
+         Avoid unnecessary duplicate read registrations for blocking I/O with the
+         NIO connector. (markt)
+       </fix>
++      <add>
++        Add support for TLS 1.3 client initiated re-keying. (markt)
++      </add>
+     </changelog>
+   </subsection>
+   <subsection name="WebSocket">
