@@ -58,7 +58,7 @@
 Name:          pki-servlet-engine
 Epoch:         1
 Version:       %{major_version}.%{minor_version}.%{micro_version}
-Release:       1%{?dist}.2
+Release:       1%{?dist}.3
 Summary:       Apache Servlet/JSP Engine, RI for Servlet %{servletspec}/JSP %{jspspec} API
 Group:         System Environment/Daemons
 License:       ASL 2.0
@@ -83,6 +83,9 @@ Patch2:        tomcat-%{major_version}.%{minor_version}-catalina-policy.patch
 Patch3:        exclude-OSGi-metadata.patch
 Patch4:        rhbz-2314686.patch
 Patch5:        rhbz-2332817.patch
+Patch6:        message-byte-conversion.patch
+Patch7:        rhbz-2362782.patch
+Patch8:        rhbz-2406591.patch
 
 BuildArch:     noarch
 
@@ -147,6 +150,9 @@ find . -type f \( -name "*.bat" -o -name "*.class" -o -name Thumbs.db -o -name "
 %patch3 -p0
 %patch4 -p0
 %patch5 -p0
+%patch6 -p0
+%patch7 -p0
+%patch8 -p0
 
 # Since we don't support ECJ in RHEL anymore, remove the class that requires it
 %{__rm} -f java/org/apache/jasper/compiler/JDTCompiler.java
@@ -389,6 +395,12 @@ fi
 %{_javadir}/tomcat-servlet-%{servletspec}*.jar
 
 %changelog
+* Wed Dec 10 2025 Adam Krajcik <akrajcik@redhat.com> - 1:9.0.50-1.el9_2.3
+- Resolves: RHEL-124509
+  pki-servlet-engine: Directory traversal via rewrite with possible RCE (CVE-2025-55752)
+- Resolves: RHEL-91744
+  pki-servlet-engine: Bypass of rules in Rewrite Valve (CVE-2025-31651)
+
 * Fri Jan 17 2025 Dimitris Soumis <dsoumis@redhat.com> - 1:9.0.50-1.el9_2.2
 - Resolves: RHEL-71715
   pki-servlet-engine: RCE due to TOCTOU issue in JSP compilation (CVE-2024-50379)

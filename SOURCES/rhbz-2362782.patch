@@ -1,0 +1,582 @@
+--- java/org/apache/catalina/connector/CoyoteAdapter.java
++++ java/org/apache/catalina/connector/CoyoteAdapter.java
+@@ -663,21 +663,19 @@
+                 response.sendError(400, "Invalid URI");
+             }
+         } else {
+-            /* The URI is chars or String, and has been sent using an in-memory
+-             * protocol handler. The following assumptions are made:
+-             * - req.requestURI() has been set to the 'original' non-decoded,
+-             *   non-normalized URI
+-             * - req.decodedURI() has been set to the decoded, normalized form
+-             *   of req.requestURI()
++            /*
++             * The URI is chars or String, and has been sent using an in-memory protocol handler. The following
++             * assumptions are made:
++             *
++             * - req.requestURI() has been set to the 'original' non-decoded, non-normalized URI that includes path
++             * parameters (if any)
++             *
++             * - req.decodedURI() has been set to the decoded, normalized form of req.requestURI() with any path
++             * parameters removed
++             *
++             * - 'suspicious' URI filtering, if required, has already been performed
+              */
+             decodedURI.toChars();
+-            // Remove all path parameters; any needed path parameter should be set
+-            // using the request object rather than passing it in the URL
+-            CharChunk uriCC = decodedURI.getCharChunk();
+-            int semicolon = uriCC.indexOf(';');
+-            if (semicolon > 0) {
+-                decodedURI.setChars(uriCC.getBuffer(), uriCC.getStart(), semicolon);
+-            }
+         }
+
+         // Request mapping.
+--- java/org/apache/catalina/valves/rewrite/RewriteValve.java
++++ java/org/apache/catalina/valves/rewrite/RewriteValve.java
+@@ -21,6 +21,7 @@
+ import java.io.InputStream;
+ import java.io.InputStreamReader;
+ import java.io.StringReader;
++import java.net.URLDecoder;
+ import java.nio.charset.Charset;
+ import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
+@@ -68,6 +69,24 @@
+  */
+ public class RewriteValve extends ValveBase {
+
++    private static final URLEncoder REWRITE_DEFAULT_ENCODER;
++    private static final URLEncoder REWRITE_QUERY_ENCODER;
++
++    static {
++        /*
++         * See the detailed explanation of encoding/decoding during URL re-writing in the invoke() method.
++         *
++         * These encoders perform the second stage of encoding, after re-writing has completed. These rewrite specific
++         * encoders treat '%' as a safe character so that URLs and query strings already processed by encodeForRewrite()
++         * do not end up with double encoding of '%' characters.
++         */
++        REWRITE_DEFAULT_ENCODER = (URLEncoder) URLEncoder.DEFAULT.clone();
++        REWRITE_DEFAULT_ENCODER.addSafeCharacter('%');
++
++        REWRITE_QUERY_ENCODER = (URLEncoder) URLEncoder.QUERY.clone();
++        REWRITE_QUERY_ENCODER.addSafeCharacter('%');
++    }
++
+     /**
+      * The rewrite rules that the valve will use.
+      */
+@@ -305,22 +324,51 @@
+
+             invoked.set(Boolean.TRUE);
+
+-            // As long as MB isn't a char sequence or affiliated, this has to be
+-            // converted to a string
++            // As long as MB isn't a char sequence or affiliated, this has to be converted to a string
+             Charset uriCharset = request.getConnector().getURICharset();
+             String originalQueryStringEncoded = request.getQueryString();
+             MessageBytes urlMB =
+                     context ? request.getRequestPathMB() : request.getDecodedRequestURIMB();
+             urlMB.toChars();
+             CharSequence urlDecoded = urlMB.getCharChunk();
++
++            /*
++             * The URL presented to the rewrite valve is the URL that is used for request mapping. That URL has been
++             * processed to: remove path parameters; remove the query string; decode; and normalize the URL. It may
++             * contain literal '%', '?' and/or ';' characters at this point.
++             *
++             * The re-write rules need to be able to process URLs with literal '?' characters and add query strings
++             * without the two becoming confused. The re-write rules also need to be able to insert literal '%'
++             * characters without them being confused with %nn encoding.
++             *
++             * The re-write rules cannot insert path parameters.
++             *
++             * To meet these requirement, the URL is processed as follows.
++             *
++             * Step 1. The URL is partially re-encoded by encodeForRewrite(). This method encodes any literal '%', ';'
++             * and/or '?' characters in the URL using the standard %nn form.
++             *
++             * Step 2. The re-write processing runs with the provided re-write rules against the partially encoded URL.
++             * If a re-write rule needs to insert a literal '%', ';' or '?', it must do so in %nn encoded form.
++             *
++             * Step 3. The URL (and query string if present) is re-encoded using the re-write specific encoders
++             * (REWRITE_DEFAULT_ENCODER and REWRITE_QUERY_ENCODER) that behave the same was as the standard encoders
++             * apart from '%' being treated as a safe character. This prevents double encoding of any '%' characters
++             * present in the URL from steps 1 or 2.
++             */
++
++            // Step 1. Encode URL for processing by the re-write rules.
++            CharSequence urlRewriteEncoded = encodeForRewrite(urlDecoded);
+             CharSequence host = request.getServerName();
+             boolean rewritten = false;
+             boolean done = false;
+             boolean qsa = false;
+             boolean qsd = false;
++
++            // Step 2. Process the URL using the re-write rules.
+             for (int i = 0; i < rules.length; i++) {
+                 RewriteRule rule = rules[i];
+-                CharSequence test = (rule.isHost()) ? host : urlDecoded;
++                CharSequence test = (rule.isHost()) ? host : urlRewriteEncoded;
+                 CharSequence newtest = rule.evaluate(test, resolver);
+                 if (newtest != null && !test.equals(newtest.toString())) {
+                     if (containerLog.isDebugEnabled()) {
+@@ -330,7 +378,7 @@
+                     if (rule.isHost()) {
+                         host = newtest;
+                     } else {
+-                        urlDecoded = newtest;
++                        urlRewriteEncoded = newtest;
+                     }
+                     rewritten = true;
+                 }
+@@ -363,29 +411,30 @@
+                 if (rule.isRedirect() && newtest != null) {
+                     // Append the query string to the url if there is one and it
+                     // hasn't been rewritten
+-                    String urlStringDecoded = urlDecoded.toString();
+-                    int index = urlStringDecoded.indexOf('?');
+-                    String rewrittenQueryStringDecoded;
++                    String urlStringRewriteEncoded = urlRewriteEncoded.toString();
++                    int index = urlStringRewriteEncoded.indexOf('?');
++                    String rewrittenQueryStringRewriteEncoded;
+                     if (index == -1) {
+-                        rewrittenQueryStringDecoded = null;
++                        rewrittenQueryStringRewriteEncoded = null;
+                     } else {
+-                        rewrittenQueryStringDecoded = urlStringDecoded.substring(index + 1);
+-                        urlStringDecoded = urlStringDecoded.substring(0, index);
+-                    }
+-
++                        rewrittenQueryStringRewriteEncoded = urlStringRewriteEncoded.substring(index + 1);
++                        urlStringRewriteEncoded = urlStringRewriteEncoded.substring(0, index);
++                    }
++
++                    // Step 3. Complete the 2nd stage to encoding.
+                     StringBuilder urlStringEncoded =
+-                            new StringBuilder(URLEncoder.DEFAULT.encode(urlStringDecoded, uriCharset));
+-                    if (!qsd && originalQueryStringEncoded != null
+-                            && originalQueryStringEncoded.length() > 0) {
+-                        if (rewrittenQueryStringDecoded == null) {
++                            new StringBuilder(REWRITE_DEFAULT_ENCODER.encode(urlStringRewriteEncoded, uriCharset));
++
++                    if (!qsd && originalQueryStringEncoded != null && !originalQueryStringEncoded.isEmpty()) {
++                        if (rewrittenQueryStringRewriteEncoded == null) {
+                             urlStringEncoded.append('?');
+                             urlStringEncoded.append(originalQueryStringEncoded);
+                         } else {
+                             if (qsa) {
+                                 // if qsa is specified append the query
+                                 urlStringEncoded.append('?');
+-                                urlStringEncoded.append(URLEncoder.QUERY.encode(
+-                                        rewrittenQueryStringDecoded, uriCharset));
++                                urlStringEncoded.append(
++                                        REWRITE_QUERY_ENCODER.encode(rewrittenQueryStringRewriteEncoded, uriCharset));
+                                 urlStringEncoded.append('&');
+                                 urlStringEncoded.append(originalQueryStringEncoded);
+                             } else if (index == urlStringEncoded.length() - 1) {
+@@ -394,14 +443,14 @@
+                                 urlStringEncoded.deleteCharAt(index);
+                             } else {
+                                 urlStringEncoded.append('?');
+-                                urlStringEncoded.append(URLEncoder.QUERY.encode(
+-                                        rewrittenQueryStringDecoded, uriCharset));
++                                urlStringEncoded.append(
++                                        REWRITE_QUERY_ENCODER.encode(rewrittenQueryStringRewriteEncoded, uriCharset));
+                             }
+                         }
+-                    } else if (rewrittenQueryStringDecoded != null) {
++                    } else if (rewrittenQueryStringRewriteEncoded != null) {
+                         urlStringEncoded.append('?');
+-                        urlStringEncoded.append(
+-                                URLEncoder.QUERY.encode(rewrittenQueryStringDecoded, uriCharset));
++                        urlStringEncoded
++                                .append(REWRITE_QUERY_ENCODER.encode(rewrittenQueryStringRewriteEncoded, uriCharset));
+                     }
+
+                     // Insert the context if
+@@ -479,12 +528,12 @@
+             if (rewritten) {
+                 if (!done) {
+                     // See if we need to replace the query string
+-                    String urlStringDecoded = urlDecoded.toString();
+-                    String queryStringDecoded = null;
+-                    int queryIndex = urlStringDecoded.indexOf('?');
++                    String urlStringRewriteEncoded = urlRewriteEncoded.toString();
++                    String queryStringRewriteEncoded = null;
++                    int queryIndex = urlStringRewriteEncoded.indexOf('?');
+                     if (queryIndex != -1) {
+-                        queryStringDecoded = urlStringDecoded.substring(queryIndex+1);
+-                        urlStringDecoded = urlStringDecoded.substring(0, queryIndex);
++                        queryStringRewriteEncoded = urlStringRewriteEncoded.substring(queryIndex + 1);
++                        urlStringRewriteEncoded = urlStringRewriteEncoded.substring(0, queryIndex);
+                     }
+                     // Save the current context path before re-writing starts
+                     String contextPath = null;
+@@ -498,24 +547,25 @@
+                         // This is neither decoded nor normalized
+                         chunk.append(contextPath);
+                     }
+-                    chunk.append(URLEncoder.DEFAULT.encode(urlStringDecoded, uriCharset));
++
++                    // Step 3. Complete the 2nd stage to encoding.
++                    chunk.append(REWRITE_DEFAULT_ENCODER.encode(urlStringRewriteEncoded, uriCharset));
+                     // Decoded and normalized URI
+                     // Rewriting may have denormalized the URL
+-                    urlStringDecoded = RequestUtil.normalize(urlStringDecoded);
++                    urlStringRewriteEncoded = RequestUtil.normalize(urlStringRewriteEncoded);
+                     request.getCoyoteRequest().decodedURI().setChars(MessageBytes.EMPTY_CHAR_ARRAY, 0, 0);
+                     chunk = request.getCoyoteRequest().decodedURI().getCharChunk();
+                     if (context) {
+                         // This is decoded and normalized
+                         chunk.append(request.getServletContext().getContextPath());
+                     }
+-                    chunk.append(urlStringDecoded);
++                    chunk.append(URLDecoder.decode(urlStringRewriteEncoded, String.valueOf(uriCharset)));
+                     // Set the new Query if there is one
+-                    if (queryStringDecoded != null) {
++                    if (queryStringRewriteEncoded != null) {
+                         request.getCoyoteRequest().queryString().setChars(MessageBytes.EMPTY_CHAR_ARRAY, 0, 0);
+                         chunk = request.getCoyoteRequest().queryString().getCharChunk();
+-                        chunk.append(URLEncoder.QUERY.encode(queryStringDecoded, uriCharset));
+-                        if (qsa && originalQueryStringEncoded != null &&
+-                                originalQueryStringEncoded.length() > 0) {
++                        chunk.append(REWRITE_QUERY_ENCODER.encode(queryStringRewriteEncoded, uriCharset));
++                        if (qsa && originalQueryStringEncoded != null && !originalQueryStringEncoded.isEmpty()) {
+                             chunk.append('&');
+                             chunk.append(originalQueryStringEncoded);
+                         }
+@@ -786,4 +836,31 @@
+             throw new IllegalArgumentException(sm.getString("rewriteValve.invalidFlags", line, flag));
+         }
+     }
++
++
++    private CharSequence encodeForRewrite(CharSequence input) {
++        StringBuilder result = null;
++        int pos = 0;
++        int mark = 0;
++        while (pos < input.length()) {
++            char c = input.charAt(pos);
++            if (c == '%' || c == ';' || c == '?') {
++                if (result == null) {
++                    result = new StringBuilder((int) (input.length() * 1.1));
++                }
++                result.append(input.subSequence(mark, pos));
++                result.append('%');
++                result.append(Character.forDigit((c >> 4) & 0xF, 16));
++                result.append(Character.forDigit(c & 0xF, 16));
++                mark = pos + 1;
++            }
++            pos++;
++        }
++        if (result != null) {
++            result.append(input.subSequence(mark, input.length()));
++            return result;
++        } else {
++            return input;
++        }
++    }
+ }
+--- test/org/apache/catalina/valves/rewrite/TestRewriteValve.java
++++ test/org/apache/catalina/valves/rewrite/TestRewriteValve.java
+@@ -17,10 +17,13 @@
+ package org.apache.catalina.valves.rewrite;
+
+ import java.net.HttpURLConnection;
++import java.net.URLDecoder;
+ import java.nio.charset.StandardCharsets;
+ import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
++
++import javax.servlet.http.HttpServletResponse;
+
+ import org.junit.Assert;
+ import org.junit.Test;
+@@ -50,7 +53,7 @@
+
+     @Test
+     public void testBackslashPercentSign() throws Exception {
+-        doTestRewrite("RewriteRule ^(.*) /a/\\%5A", "/", "/a/%255A");
++        doTestRewrite("RewriteRule ^(.*) /a/\\%5A", "/", "/a/%5A");
+     }
+
+     @Test
+@@ -227,7 +230,7 @@
+     public void testNonAsciiQueryStringWithB() throws Exception {
+         doTestRewrite("RewriteRule ^/b/(.*)/id=(.*) /c?filename=$1&id=$2 [B]",
+                 "/b/file01/id=%E5%9C%A8%E7%BA%BF%E6%B5%8B%E8%AF%95", "/c",
+-                "filename=file01&id=%25E5%259C%25A8%25E7%25BA%25BF%25E6%25B5%258B%25E8%25AF%2595");
++                "filename=file01&id=%E5%9C%A8%E7%BA%BF%E6%B5%8B%E8%AF%95");
+     }
+
+
+@@ -235,9 +238,8 @@
+     public void testNonAsciiQueryStringAndPathAndRedirectWithB() throws Exception {
+         // Note the double encoding of the result (httpd produces the same result)
+         doTestRewrite("RewriteRule ^/b/(.*)/(.*)/id=(.*) /c/$1?filename=$2&id=$3 [B,R]",
+-                "/b/%E5%9C%A8%E7%BA%BF/file01/id=%E6%B5%8B%E8%AF%95",
+-                "/c/%25E5%259C%25A8%25E7%25BA%25BF",
+-                "filename=file01&id=%25E6%25B5%258B%25E8%25AF%2595");
++                "/b/%E5%9C%A8%E7%BA%BF/file01/id=%E6%B5%8B%E8%AF%95", "/c/%E5%9C%A8%E7%BA%BF",
++                "filename=file01&id=%E6%B5%8B%E8%AF%95");
+     }
+
+
+@@ -252,8 +254,8 @@
+     @Test
+     public void testUtf8WithBothQsFlagsB() throws Exception {
+         // Note %C2%A1 == \u00A1
+-        doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [B]",
+-                "/b/%C2%A1/id=%C2%A1?di=%C2%AE", "/c/%C2%A1%25C2%25A1", "id=%25C2%25A1");
++        doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [B]", "/b/%C2%A1/id=%C2%A1?di=%C2%AE",
++                "/c/%C2%A1%C2%A1", "id=%C2%A1");
+     }
+
+
+@@ -268,8 +270,8 @@
+     @Test
+     public void testUtf8WithBothQsFlagsRB() throws Exception {
+         // Note %C2%A1 == \u00A1
+-        doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [R,B]",
+-                "/b/%C2%A1/id=%C2%A1?di=%C2%AE", "/c/%C2%A1%25C2%25A1", "id=%25C2%25A1");
++        doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [R,B]", "/b/%C2%A1/id=%C2%A1?di=%C2%AE",
++                "/c/%C2%A1%C2%A1", "id=%C2%A1");
+     }
+
+
+@@ -296,9 +298,8 @@
+     @Test
+     public void testUtf8WithBothQsFlagsBQSA() throws Exception {
+         // Note %C2%A1 == \u00A1
+-        doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [B,QSA]",
+-                "/b/%C2%A1/id=%C2%A1?di=%C2%AE", "/c/%C2%A1%25C2%25A1",
+-                "id=%25C2%25A1&di=%C2%AE");
++        doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [B,QSA]", "/b/%C2%A1/id=%C2%A1?di=%C2%AE",
++                "/c/%C2%A1%C2%A1", "id=%C2%A1&di=%C2%AE");
+     }
+
+
+@@ -314,9 +315,8 @@
+     @Test
+     public void testUtf8WithBothQsFlagsRBQSA() throws Exception {
+         // Note %C2%A1 == \u00A1
+-        doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [R,B,QSA]",
+-                "/b/%C2%A1/id=%C2%A1?di=%C2%AE", "/c/%C2%A1%25C2%25A1",
+-                "id=%25C2%25A1&di=%C2%AE");
++        doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [R,B,QSA]", "/b/%C2%A1/id=%C2%A1?di=%C2%AE",
++                "/c/%C2%A1%C2%A1", "id=%C2%A1&di=%C2%AE");
+     }
+
+
+@@ -351,8 +351,8 @@
+     @Test
+     public void testUtf8WithOriginalQsFlagsB() throws Exception {
+         // Note %C2%A1 == \u00A1
+-        doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [B]",
+-                "/b/%C2%A1?id=%C2%A1", "/c/%C2%A1%25C2%25A1", "id=%C2%A1");
++        doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [B]", "/b/%C2%A1?id=%C2%A1", "/c/%C2%A1%C2%A1",
++                "id=%C2%A1");
+     }
+
+
+@@ -367,8 +367,8 @@
+     @Test
+     public void testUtf8WithOriginalQsFlagsRB() throws Exception {
+         // Note %C2%A1 == \u00A1
+-        doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [R,B]",
+-                "/b/%C2%A1?id=%C2%A1", "/c/%C2%A1%25C2%25A1", "id=%C2%A1");
++        doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [R,B]", "/b/%C2%A1?id=%C2%A1", "/c/%C2%A1%C2%A1",
++                "id=%C2%A1");
+     }
+
+
+@@ -403,8 +403,8 @@
+     @Test
+     public void testUtf8WithRewriteQsFlagsB() throws Exception {
+         // Note %C2%A1 == \u00A1
+-        doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [B]",
+-                "/b/%C2%A1/id=%C2%A1", "/c/%C2%A1%25C2%25A1", "id=%25C2%25A1");
++        doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [B]", "/b/%C2%A1/id=%C2%A1", "/c/%C2%A1%C2%A1",
++                "id=%C2%A1");
+     }
+
+
+@@ -428,8 +428,8 @@
+     @Test
+     public void testUtf8WithRewriteQsFlagsRB() throws Exception {
+         // Note %C2%A1 == \u00A1
+-        doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [R,B]",
+-                "/b/%C2%A1/id=%C2%A1", "/c/%C2%A1%25C2%25A1", "id=%25C2%25A1");
++        doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [R,B]", "/b/%C2%A1/id=%C2%A1", "/c/%C2%A1%C2%A1",
++                "id=%C2%A1");
+     }
+
+
+@@ -472,7 +472,7 @@
+     @Test
+     public void testUtf8FlagsB() throws Exception {
+         // Note %C2%A1 == \u00A1
+-        doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [B]", "/b/%C2%A1", "/c/%C2%A1%25C2%25A1");
++        doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [B]", "/b/%C2%A1", "/c/%C2%A1%C2%A1");
+     }
+
+
+@@ -486,7 +486,7 @@
+     @Test
+     public void testUtf8FlagsRB() throws Exception {
+         // Note %C2%A1 == \u00A1
+-        doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [R,B]", "/b/%C2%A1", "/c/%C2%A1%25C2%25A1");
++        doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [R,B]", "/b/%C2%A1", "/c/%C2%A1%C2%A1");
+     }
+
+
+@@ -652,6 +652,7 @@
+         rewriteValve.setConfiguration(config);
+
+         Tomcat.addServlet(ctx, "snoop", new SnoopServlet());
++        ctx.addServletMappingDecoded("/a/Z", "snoop");
+         ctx.addServletMappingDecoded("/a/%5A", "snoop");
+         ctx.addServletMappingDecoded("/c/*", "snoop");
+         Tomcat.addServlet(ctx, "default", new DefaultServlet());
+@@ -722,4 +723,87 @@
+             Assert.assertEquals(expectedStatusCode, rc);
+         }
+     }
++
++
++    @Test
++    public void testEncodedUriSimple() throws Exception {
++        doTestRewriteWithEncoding("aaa");
++    }
++
++
++    @Test
++    public void testEncodedUriEncodedQuestionMark01() throws Exception {
++        doTestRewriteWithEncoding("a%3fa");
++    }
++
++
++    @Test
++    public void testEncodedUriEncodedQuestionMark02() throws Exception {
++        doTestRewriteWithEncoding("%3faa");
++    }
++
++
++    @Test
++    public void testEncodedUriEncodedQuestionMark03() throws Exception {
++        doTestRewriteWithEncoding("aa%3f");
++    }
++
++
++    @Test
++    public void testEncodedUriEncodedQuestionMarkAndQueryString() throws Exception {
++        doTestRewriteWithEncoding("a%3fa?b=c", "a%3fa", "b=c");
++    }
++
++
++    @Test
++    public void testEncodedUriEncodedSemicolon01() throws Exception {
++        doTestRewriteWithEncoding("a%3ba");
++    }
++
++
++    @Test
++    public void testEncodedUriEncodedSemicolon02() throws Exception {
++        doTestRewriteWithEncoding("%3baa");
++    }
++
++
++    @Test
++    public void testEncodedUriEncodedSemicolon03() throws Exception {
++        doTestRewriteWithEncoding("aa%3b");
++    }
++
++
++    private void doTestRewriteWithEncoding(String segment) throws Exception {
++        doTestRewriteWithEncoding(segment, segment, null);
++    }
++
++    private void doTestRewriteWithEncoding(String segment, String expectedSegment, String expectedQueryString)
++        throws Exception {
++        Tomcat tomcat = getTomcatInstance();
++
++        // No file system docBase required
++        Context ctx = tomcat.addContext("", null);
++
++        RewriteValve rewriteValve = new RewriteValve();
++        tomcat.getHost().getPipeline().addValve(rewriteValve);
++
++        rewriteValve.setConfiguration("RewriteRule ^/source/(.*)$ /target/$1");
++
++        Tomcat.addServlet(ctx, "snoop", new SnoopServlet());
++        ctx.addServletMappingDecoded("/target/*", "snoop");
++
++        tomcat.start();
++
++        ByteChunk res = new ByteChunk();
++        int rc = getUrl("http://localhost:" + getPort() + "/source/" + segment, res, false);
++
++        Assert.assertEquals(HttpServletResponse.SC_OK, rc);
++
++        res.setCharset(StandardCharsets.UTF_8);
++        String body = res.toString();
++        Assert.assertTrue(body, body.contains("REQUEST-URI: /target/" + expectedSegment));
++        Assert.assertTrue(body, body.contains("PATH-INFO: /" +
++            URLDecoder.decode(expectedSegment, String.valueOf(StandardCharsets.UTF_8))));
++        Assert.assertTrue(body, body.contains("REQUEST-QUERY-STRING: " + expectedQueryString));
++    }
+ }
+--- webapps/docs/changelog.xml
++++ webapps/docs/changelog.xml
+@@ -105,6 +105,16 @@
+   issues do not "pop up" wrt. others).
+ -->
+ <section name="Tomcat 9.0.50-redhat (szappis)">
++  <subsection name="Catalina">
++    <changelog>
++      <fix>
++        <bug>60940</bug>: Improve the handling of the <code>META-INF/</code> and
++        <code>META-INF/MANIFEST.MF</code> entries for Jar files located in
++        <code>/WEB-INF/lib</code> when running a web application from a packed
++        WAR file. (markt)
++      </fix>
++    </changelog>
++  </subsection>
+   <subsection name="Coyote">
+     <changelog>
+       <fix>
+--- webapps/docs/rewrite.xml
++++ webapps/docs/rewrite.xml
+@@ -52,6 +52,28 @@
+   <p>It can also be in the context.xml of a webapp.
+   The valve will then use a <code>rewrite.config</code> file containing the
+   rewrite directives, it must be placed in the WEB-INF folder of the web application
++  </p>
++
++</section>
++
++<section name="Using rewrite rules with special characters">
++
++  <p>The URL presented to the rewrite valve is the same URL used for request
++  mapping with any literal <code>'%'</code>, <code>';'</code> and/or
++  <code>'?'</code> characters encoded in <code>%nn</code> form.</p>
++
++  <p>A rewrite rule that wishes to insert a literal <code>'%'</code>,
++  <code>';'</code>, <code>'?'</code>, <code>'&amp;'</code> or <code>'='</code>
++  character should do so in <code>%nn</code> form. Other characters maybe
++  inserted in either literal or <code>%nn</code> form.</p>
++
++  <p>This enables the rewrite rules to:
++  <ul>
++  <li>process URLs containing literal <code>'?'</code> characters;</li>
++  <li>add a query string;</li>
++  <li>insert a literal <code>'%'</code> character without it being confused with
++  <code>%nn</code> encoding.</li>
++  </ul>
+   </p>
+ 
+ </section>
